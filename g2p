@@ -1,0 +1,184 @@
+#!/usr/bin/env python
+
+import os, sys, subprocess, getopt, time
+from gppg import *
+
+
+# -----------------------------------------------------
+class Global:
+    verbose = False
+    src = DB()
+    dst = DB()
+    cname = ''
+    owner = ''
+
+G = Global()
+
+# -----------------------------------------------------
+def copy():
+    
+    G.dst.psql_quiet('CREATE SCHEMA gppg;')
+
+    srctab = G.src.getTableInfo()
+    if not srctab:
+        sys.exit('ERROR: Source table %s.%s does not exist or cannot be accessed.' % (dq(G.src.sname), dq(G.src.tname)))
+    
+    # on dst, create table
+    sql = '''
+DROP TABLE IF EXISTS gppg.%s;
+CREATE UNLOGGED TABLE gppg.%s (
+%s
+);''' % (dq(G.dst.tname), dq(G.dst.tname), srctab.columnAndTypeClause())
+
+    pr_dst(sql)
+    G.dst.psql(sql)
+
+    # on dst, start insert from stdin
+    sql = 'COPY gppg.%s FROM stdin' % (dq(G.dst.tname))
+    pr_dst(sql)
+    dstProc = G.dst.psql_raw(sql, stdin=subprocess.PIPE)
+    if not dstProc:
+        sys.exit(1)
+    inp = dstProc.stdin
+
+    # on src, do select and pipe stdout to stdin of the dst insert
+    sql = 'COPY %s.%s TO stdout' % (dq(G.src.sname), dq(G.src.tname))
+    pr_src(sql)
+    srcProc = G.src.psql_raw(sql, stdout=inp)
+    if not srcProc:
+        sys.exit(1)
+
+    # wait for the processes
+    while 1:
+        if dstProc.poll() != None: break
+        if srcProc.poll() != None: break
+        time.sleep(1)
+
+    # if dst ended but not src, we have failed and we can kill it
+    if srcProc.poll() == None:
+        srcProc.kill()
+        dstProc.kill()
+        sys.exit("Dst table ended before src")
+
+    if srcProc.wait():
+        sys.exit('Error COPY OUT from src')
+    inp.close()
+    if dstProc.wait():
+        sys.exit('ERROR COPY IN to dst')
+
+    # on dst, create primary key
+    if G.cname:
+        sql = 'ALTER TABLE gppg.%s add primary key (%s);' % (dq(G.dst.tname), dq(G.cname))
+        pr_dst(sql)
+        G.dst.psql(sql)
+
+    # on dst, move table into place
+    sql = '''
+DROP TABLE IF EXISTS %s.%s;
+ALTER TABLE gppg.%s set schema %s;'''
+    sql = sql % (dq(G.dst.sname), dq(G.dst.tname), dq(G.dst.tname), dq(G.dst.sname))
+    pr_dst(sql)
+    G.dst.psql(sql)
+    
+
+# -----------------------------------------------------
+def sync():
+    sys.exit('not implemented')
+    
+
+# -----------------------------------------------------
+def usage(msg=''):
+    sys.exit('''Usage: %s command 
+
+Command may be copy or sync, as detailed below:
+
+copy [-u user -p port -d dbname] -s gpschema -t gptabname 
+    -U user -H host [-P port] -D dbname 
+    [-S pgschema -T pgtabname] [-O owner] [-c pkey] 
+
+sync -c pkey [-u user -p port -d dbname] -s gpschema -t gptabname
+    -U user -H host [-P port] -D dbname 
+    [-S pgschema -T pgtabname] [-O owner]
+
+Note:
+    Lowercase flags are used to specify source (gp) properties.
+    Uppercase flags are used to specify destination (pg) properties.
+    
+    -u -p -d may be supplied via environ variables PGUSER, PGPORT, PGDATABASE.
+    -S -T are defaulted to the values of -s and -t if not supplied.
+
+    Password to the destination database is expected in the env
+        PGPASSWORD_{DBNAME}_{USER}
+
+    The source database is always localhost, and its password must be 
+    specified in PGPASSWORD env.
+
+%s
+''' % (sys.argv[0], msg))
+
+
+
+# -----------------------------------------------------
+def main():
+    if len(sys.argv) <= 1:
+        usage()
+
+    op = sys.argv[1]
+    if op not in ('copy', 'sync'):
+        usage()
+
+    opts, args = getopt.getopt(sys.argv[2:], 'vu:p:d:s:t:U:H:P:D:S:T:O:c:')
+    for o, v in opts:
+        if o == '-v':       G.verbose = True
+	elif o == '-u':     G.src.user = v
+        elif o == '-p':     G.src.port = v
+        elif o == '-d':     G.src.dbname = v
+        elif o == '-s':     G.src.sname = v
+        elif o == '-t':     G.src.tname = v
+        elif o == '-U':     G.dst.user = v
+        elif o == '-H':     G.dst.host = v
+        elif o == '-P':     G.dst.port = v
+        elif o == '-D':     G.dst.dbname = v
+        elif o == '-S':     G.dst.sname = v
+        elif o == '-T':     G.dst.tname = v
+        elif o == '-O':     G.owner = v
+        elif o == '-c':     G.cname = v
+        else:
+            usage('ERROR: bad option %s' % o)
+
+    # Set all the defaults
+    G.src.host = 'localhost'  # always the case
+    if not G.src.port: G.src.port = os.environ.get('PGPORT', '5432')
+    if not G.dst.port: G.dst.port = '5432'
+    if not G.src.user:
+        G.src.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
+        if not G.src.user:
+            sys.exit('Please specify user of source DB in PGUSER env')
+    if not G.src.dbname:
+        G.src.dbname = os.environ.get('PGDATABASE', '')
+        if not G.src.dbname:
+            sys.exit('Please specify source DB name in PGDATABASE env')
+    if not G.src.sname: G.src.sname = G.dst.sname
+    if not G.src.tname: G.src.tname = G.dst.tname
+    if not G.owner: G.owner = G.dst.user
+
+    # Check for missing arguments and options
+    if not G.dst.user: sys.exit('Please specify -U user.')
+    if not G.dst.host: sys.exit('Please specify -H host.')
+    if not G.dst.dbname: sys.exit('Please specify -D dbname.')
+    if not G.dst.sname: sys.exit('Please specify -S schema.')
+    if not G.dst.tname: sys.exit('Please specify -T tabname.')
+
+    set_verbose(G.verbose)
+
+    if op == 'copy':
+        copy()
+    elif op == 'sync':
+        sync()
+    else:
+        usage('Error: please specify copy or sync.')
+    
+      
+# -----------------------------------------------------
+if __name__ == '__main__':
+    main()

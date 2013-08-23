@@ -1,0 +1,248 @@
+#!/usr/bin/env python
+#
+import sys, os, getopt
+from gppg import *
+
+def usage(msg=''):
+    sys.exit('''usage: %s [-i interval] -c tscolumn -D dbname -S schema -T tabname -O owner [-v]
+
+Partition a table into monthly sub-partitions.
+
+If -i interval is specified, compress any partition created before now() - interval.
+
+
+%s''' % (sys.argv[0], msg))
+
+
+# -----------------------------------------------------
+def setup_default_partition():
+    pr('--', '''
+    SETUP DEFAULT PARTITION
+    ''')
+    sql = 'select * from %s.%s limit 1'
+    sql = sql % (dq(G.dst.sname), dq(G.dst.tname + '_1_prt_other'))
+    rc = G.dst.psql_quiet(sql)
+    if rc:
+        sql = '''/* gpart.setup_default_partition */ 
+        set search_path=%s;
+        drop table if exists x;
+        alter table %s rename to x;
+        create table %s (like x) partition by range (%s) (default partition other);
+        alter table %s owner to %s;
+        alter table %s exchange default partition with table x;
+        drop table x;
+        '''
+        sql = sql % (dq(G.dst.sname), 
+                     dq(G.dst.tname),
+                     dq(G.dst.tname), dq(G.cname),
+                     dq(G.dst.tname), G.owner,
+                     dq(G.dst.tname))
+        pr_dst(sql)
+        G.dst.psql(sql)
+
+    
+    
+# -----------------------------------------------------
+def split_default_partition():
+    pr('--', '''
+    SPLIT DEFAULT PARTITION
+    ''')
+    sql = '''/* gpart.split_default_partition */
+    set search_path=%s;
+    select to_char(%s, 'YYYYMM') from %s group by 1 order by 1;
+    ''' 
+    sql = sql % (dq(G.dst.sname), 
+                 dq(G.cname), dq(G.dst.tname + '_1_prt_other'))
+    pr_dst(sql)
+    s = G.dst.psql(sql)
+    s = s.split('\n')
+
+    # only split earlier months than the last 2-month in default partition
+    s = s[:-2]
+
+    # reverse it so that we do split the most recent month first. 
+    # later month has more data, earlier month has less data.
+    # this would allow us to process more data first, and splitting off 
+    # the biggest child partition earlier.
+    s.reverse()
+
+    # for each month ... 
+    splitCount = 0
+    for i in s:
+        y, m = int(i[:4]), int(i[4:])
+        ny, nm = y, m+1
+        if nm == 13:
+            ny, nm = ny + 1, 1
+        sql = '''/* gpart.split_default_partition */
+        alter table %s.%s split default partition
+        start ('%04d-%02d-01') inclusive
+        end ('%04d-%02d-01') exclusive
+        into (partition p%04d%02d, default partition);'''
+        sql = sql % (dq(G.dst.sname), dq(G.dst.tname),
+                     y, m,
+                     ny, nm,
+                     y, m)
+        pr_dst(sql)
+        G.dst.psql(sql)
+        splitCount = splitCount + 1
+
+    if 0 and splitCount:
+        sql = '''/* gpart.split_default_partition */
+        set search_path=%s;
+        alter table %s set with (reorganize=true);
+        '''
+        sql = sql % (dq(G.dst.sname), dq(G.dst.tname + '_1_prt_other'))
+        pr_dst(sql)
+        G.dst.psql(sql)
+        
+# -----------------------------------------------------
+def split_default_partition_en_masse():
+    pr('--', '''
+    SPLIT DEFAULT PARTITION
+    ''')
+    sql = '''/* gpart.split_default_partition */
+    set search_path=%s;
+    select to_char(%s, 'YYYYMM') from %s group by 1 order by 1;
+    ''' 
+    sql = sql % (dq(G.dst.sname), 
+                 dq(G.cname), dq(G.dst.tname + '_1_prt_other'))
+    pr_dst(sql)
+    s = G.dst.psql(sql)
+    s = s.split('\n')
+
+    # keep the last month in the default partition
+    s = s[:-1]
+
+    sql = []
+    sql += ['set search_path=%s' % dq(G.dst.sname)]
+    sql += ['begin']
+    sql += ['drop table if exists x']
+    sql += ['create table x (like %s)' % dq(G.dst.tname)]
+    sql += ['alter table x owner to %s' % G.owner]
+    sql += ['alter table %s exchange default partition with table x' % dq(G.dst.tname)]
+    sql += ['alter table %s drop default partition' % dq(G.dst.tname)]
+    for i in s:
+        y, m = int(i[:4]), int(i[4:])
+        ny, nm = y, m+1
+        if nm == 13:
+            ny, nm = ny + 1, 1
+
+        sql += ['''alter table %s add partition 
+        start ('%04d-%02d-01') inclusive
+        end ('%04d-%02d-01') exclusive''' % (dq(G.dst.tname),
+                                             y, m, 
+                                             ny, nm)]
+        sql += ['''alter table %s 
+        rename partition for ('%04d-%02d-01') 
+        to p%04d%02d''' % (dq(G.dst.tname), 
+                           y, m,
+                           y, m)]
+
+    sql += ['alter table %s add default partition other' % dq(G.dst.tname)]
+    sql += ['insert into %s select * from x' % dq(G.dst.tname)]
+    sql += ['drop table x']
+    sql += ['commit']
+
+    sql = ';\n'.join(sql)
+    pr_dst(sql)
+    G.dst.psql(sql)
+        
+
+# -----------------------------------------------------
+def compress_partitions():
+    pr('--', '''
+    COMPRESS
+    ''')
+    sql = "select to_char(now() - '%s'::interval, 'YYYYMM')" % G.interval
+    pr_dst(sql)
+    s = G.dst.psql(sql)
+    xy, xm = int(s[:4]), int(s[4:])
+    
+    sql = '''/* gpart.compress_partitions */
+    select tablename 
+    from pg_tables 
+    where schemaname='%s' 
+      and tablename like '%s_1_prt_p%%' order by 1;'''
+    sql = sql % (G.dst.sname, G.dst.tname)
+    pr_dst(sql)
+    s = G.dst.psql(sql)
+    s = s.split('\n')
+    s = [n[-6:] for n in s]
+    for i in s:
+        y, m = int(i[:4]), int(i[4:])
+        if y > xy or (y == xy and m >= xm):
+            pass
+        sql = '''/* gpart.compress_partitions */
+        set search_path=%s;
+        drop table if exists x;
+        create table x (like %s including constraints)
+            with (orientation=column, appendonly=true, compresstype=quicklz);
+        alter table x owner to %s;
+        insert into x select * from %s;
+        alter table %s exchange partition for ('%04d-%02d-01') with table x;
+        alter table %s rename partition for ('%04d-%02d-01') to c%04d%02d;
+        drop table x;
+        '''
+        sql = sql % (dq(G.dst.sname),
+                     dq(G.dst.tname + '_1_prt_p%04d%02d' % (y, m)),
+                     G.owner,
+                     dq(G.dst.tname + '_1_prt_p%04d%02d' % (y, m)),
+                     dq(G.dst.tname), y, m,
+                     dq(G.dst.tname), y, m, y, m)
+        pr_dst(sql)
+        G.dst.psql(sql)
+        
+
+
+# -----------------------------------------------------
+class Global:
+    verbose = False
+    interval = ''
+    cname = ''
+    owner = ''
+    dst = DB()
+
+G = Global()
+
+# -----------------------------------------------------
+def main():
+    if len(sys.argv) == 1:
+        usage()
+        
+    opts, args = getopt.getopt(sys.argv[1:], 'vi:c:P:D:S:T:O:')
+    for o, v in opts:
+        if o == '-v':   G.verbose = True
+        elif o == '-i': G.interval= v
+        elif o == '-c': G.cname = v
+        elif o == '-O': G.owner = v
+        elif o == '-P': G.dst.port = v
+        elif o == '-D': G.dst.dbname = v
+        elif o == '-S': G.dst.sname = v
+        elif o == '-T': G.dst.tname = v
+
+    G.dst.host = 'localhost' # always the case
+    if not G.dst.port:
+        G.dst.port = os.environ.get('PGPORT', '5432')
+    if not G.dst.user:
+        G.dst.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
+    if not G.dst.dbname: 
+        G.dst.dbname = os.environ.get('PGDATABASE', '')
+
+    if not G.dst.user: sys.exit('Please specify -U user')
+    if not G.dst.dbname: sys.exit('Please specify -D dbname')
+    if not G.dst.sname: sys.exit('Please specify -S schema')
+    if not G.dst.tname: sys.exit('Please specify -T tabname')
+    if not G.cname: sys.exit('Please specify -c tscolumn')
+    if not G.owner: sys.exit('Please specify -O owner')
+    # note: G.interval (-i) is optional
+    
+    set_verbose(G.verbose)
+
+    setup_default_partition()
+    split_default_partition_en_masse()
+    if G.interval:
+        compress_partitions()
+    
+# -----------------------------------------------------
+if __name__ == '__main__':
+    main()

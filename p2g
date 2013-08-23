@@ -1,0 +1,428 @@
+#!/usr/bin/env python
+#
+
+import os, sys, getopt, errno, hashlib
+from gppg import *
+
+# -----------------------------------------------------
+def mkdir(path, mode):
+    try:
+        os.mkdir(path, mode)
+    except OSError as exc: 
+        if exc.errno == errno.EEXIST and os.path.isdir(path):
+            pass
+        else:
+            raise
+
+    
+# -----------------------------------------------------
+def makeExternalTable(srcdb, dstdb, srcSelect, dstColumnAndType, extName):
+    script = '''
+import os, sys, subprocess
+
+os.environ['PGUSER'] = '%s'
+os.environ['PGPASSWORD'] = '%s'
+os.environ['PGDATABASE'] = '%s'
+os.environ['PGHOST'] = '%s'
+os.environ['PGPORT'] = '%s'
+sql = """copy (%s) to stdout with csv"""
+rc = subprocess.call(['psql', '-qAt', '-c', sql], env=os.environ, stdout=sys.stdout)
+if rc: 
+    sys.exit('Failed')
+''' % (srcdb.user, srcdb.passwd, srcdb.dbname, srcdb.host, srcdb.port, srcSelect)
+
+    mkdir('/tmp/gppg', 0700)
+    m = hashlib.md5()
+    m.update(extName)
+    path = '/tmp/gppg/%s.py' % m.hexdigest()
+    f = open(path, 'w')
+    f.write(script)
+    f.close()
+
+    sql = '''
+/* on destination: create external table */
+DROP EXTERNAL TABLE IF EXISTS %s cascade;
+CREATE EXTERNAL WEB TABLE %s
+(%s)
+execute 'python "%s"' 
+on master format 'csv' encoding 'utf8';
+''' % (extName,
+       extName,
+       dstColumnAndType,
+       path)
+    
+    pr_dst(sql)
+    dstdb.psql(sql)
+    
+    
+# -----------------------------------------------------
+class Global:
+    verbose = False
+    append_only = False
+    compressed = False
+    src = DB()
+    dst = DB()
+    cname = ''
+    interval = ''
+    owner = ''
+
+G = Global()
+
+
+# -----------------------------------------------------
+def copy():
+    G.dst.psql_quiet('CREATE SCHEMA gppg; CREATE SCHEMA gppgx;')
+
+    srctab = G.src.getTableInfo()
+    if not srctab:
+        sys.exit('ERROR: Source table %s.%s does not exist or cannot be accessed.' % (dq(G.src.sname), dq(G.src.tname)))
+
+    srcSelect = 'SELECT %s FROM %s.%s'
+    srcSelect = srcSelect % (srctab.columnClauseEx() + ",xmin::text::bigint as recxmin", dq(G.src.sname), dq(G.src.tname))
+
+    extName = 'gppgx.%s' % dq(G.dst.tname)
+    makeExternalTable(G.src, G.dst, srcSelect, srctab.columnAndTypeClause() + ", recxmin bigint", extName)
+
+    if G.cname:
+        distClause = 'DISTRIBUTED BY (%s)' % dq(G.cname)
+        pkeyStmt = 'ALTER TABLE gppg.%s add primary key (%s);' % (dq(G.dst.tname), dq(G.cname))
+    else:
+        distClause = 'DISTRIBUTED RANDOMLY'
+        pkeyStmt = ''
+
+    if G.owner:
+        ownerStmt = 'ALTER TABLE gppg.%s owner to %s;' % (dq(G.dst.tname), dq(G.owner))
+    else:
+        ownerStmt = ''
+
+    withClause = ''
+    if G.compressed:
+        withClause = 'with (orientation=column, appendonly=true, compresstype=quicklz)'
+    elif G.append_only:
+        withClause = 'with (appendonly=true)'
+
+    if withClause:
+        sql = '''
+/* on destination: load from external table and replace */
+DROP TABLE IF EXISTS gppg.%s cascade;
+CREATE TABLE gppg.%s %s %s;
+INSERT into gppg.%s SELECT * FROM %s;
+''' % (dq(G.dst.tname),
+       dq(G.dst.tname), withClause, distClause,
+       dq(G.dst.tname), extName)
+    else:
+        sql = '''
+/* on destination: load from external table and replace */
+DROP TABLE IF EXISTS gppg.%s cascade;
+CREATE TABLE gppg.%s as SELECT * FROM %s %s;
+''' % (dq(G.dst.tname),
+       dq(G.dst.tname), extName, distClause)
+
+    sql = '%s\n%s\n%s' % (sql, ownerStmt, pkeyStmt)
+
+    pr_dst(sql)
+    G.dst.psql(sql)
+
+    sql = '''
+DROP TABLE IF EXISTS %s.%s CASCADE;
+ALTER TABLE gppg.%s SET SCHEMA %s;
+''' % (dq(G.dst.sname), dq(G.dst.tname),
+       dq(G.dst.tname), dq(G.dst.sname))
+
+    pr_dst(sql)
+    G.dst.psql(sql)
+    return True
+
+
+# -----------------------------------------------------
+def sync():
+    if not G.cname:
+        sys.exit('Error: -c must be specified for sync')
+        
+    G.dst.psql_quiet('CREATE SCHEMA gppg; CREATE SCHEMA gppgx;')
+    
+    srctab = G.src.getTableInfo()
+    if not srctab:
+        sys.exit('ERROR: Source table %s.%s does not exist or cannot be accessed.' % (dq(G.src.sname), dq(G.src.tname)))
+    pkey = [(a.cname, a.typeClause()) for a in srctab.attr if a.cname == G.cname]
+    if not pkey:
+        sys.exit('Error: column %s does not exist' % G.cname)
+    pkey = pkey[0]
+
+    # if schema mismatch, or dsttab does not exist, just do a copy
+    dsttab = G.dst.getTableInfo()
+    if not dsttab or not srctab.isEquiv(dsttab):
+        return copy()
+
+    # load the recxmin table (key, recxmin)
+    EXT_XMIN = 'gppgx."%s_xmin"' % G.src.tname
+    srcSelect = "SELECT %s, xmin::text::bigint as recxmin from %s.%s"
+    srcSelect = srcSelect % (dq(pkey[0]), dq(G.src.sname), dq(G.src.tname))
+    srcColType = "%s %s, recxmin bigint" % (dq(pkey[0]), pkey[1])
+    makeExternalTable(G.src, G.dst, srcSelect, srcColType, EXT_XMIN)
+
+    # diff with dsttab and create DIFF table (key, src_recxmin, dst_recxmin) for any mismatched records
+    TAB_DIFF = 'gppg."%s_diff"' % G.dst.tname
+    sqla = []
+    sql = '''
+DROP TABLE IF EXISTS %s;
+CREATE TABLE %s (
+	%s %s, src_recxmin bigint, dst_recxmin bigint)
+	WITH (appendonly=true)
+        DISTRIBUTED BY (%s);
+'''
+    sql = sql % (TAB_DIFF,
+                 TAB_DIFF,
+                 dq(pkey[0]), pkey[1],
+                 dq(pkey[0]))
+    sqla += [sql]
+
+    sql = '''
+INSERT INTO %s
+    SELECT COALESCE(s.%s, d.%s), s.recxmin as src_recxmin, d.recxmin as dst_recxmin
+      FROM %s s
+	   FULL OUTER JOIN %s.%s d using (%s)
+     WHERE s.recxmin is null or d.recxmin is null or s.recxmin != d.recxmin;
+'''
+    sql = sql % (TAB_DIFF,
+                 dq(pkey[0]), dq(pkey[0]),
+                 EXT_XMIN,
+                 dq(G.dst.sname), dq(G.dst.tname), dq(pkey[0]))
+    sqla += [sql]
+
+    pr_dst(sql)
+    G.dst.psql('\n'.join(sqla))
+
+    # get min xmin from DIFF table
+    sql = 'select min(src_recxmin) as minxmin from %s' % TAB_DIFF
+    pr_dst(sql)
+    s = G.dst.psql(sql)
+    minxmin = s.strip()
+    if not minxmin:
+        # there is no difference. we are done.
+        return True
+
+    try:
+        if int(minxmin) < 1000:
+            return copy()
+    except ValueError:
+        pass
+
+    # create DELTA table to store all rows with xmin >= min xmin
+    EXT_DELTA = 'gppgx."%s_delta"' % G.dst.tname
+    srcSelect = 'SELECT %s, xmin::text::bigint as recxmin from %s.%s where xmin::text::bigint >= %s'
+    srcSelect = srcSelect % (srctab.columnClauseEx(), dq(G.src.sname), dq(G.src.tname), minxmin)
+    srcColType = srctab.columnAndTypeClause() + ", recxmin bigint";
+    makeExternalTable(G.src, G.dst, srcSelect, srcColType, EXT_DELTA)
+
+    TAB_DELTA = 'gppg."%s_delta"' % G.dst.tname
+    sql = '''
+DROP TABLE IF EXISTS %s;
+CREATE TABLE %s as select * from %s DISTRIBUTED BY (%s)
+''' % (TAB_DELTA, TAB_DELTA, EXT_DELTA, dq(pkey[0]))
+    pr_dst(sql)
+    G.dst.psql(sql)
+
+    # Final SQL script
+    # 1. DELETE *deleted* rows
+    sqla = []
+    sql = '''
+DELETE from %s.%s a
+    USING %s b
+    WHERE a.%s = b.%s;
+''' % (dq(G.dst.sname), dq(G.dst.tname), 
+	TAB_DIFF, 
+	dq(pkey[0]), dq(pkey[0]))
+    sqla += [sql]
+
+    # 2. DELETE *updated* rows
+    sql = '''
+DELETE from %s.%s d
+  USING %s s
+  WHERE d.%s = s.%s;
+''' % (dq(G.dst.sname), dq(G.dst.tname), TAB_DELTA, dq(pkey[0]), dq(pkey[0]))
+    sqla += [sql]
+
+    # 3. INSERT delta
+    sql = '''
+INSERT into %s.%s SELECT * from %s;
+''' % (dq(G.dst.sname), dq(G.dst.tname), TAB_DELTA)
+    sqla += [sql]
+
+    # Run the SQL Script
+    pr_dst(sql)
+    G.dst.psql("\n".join(sqla))
+    
+    return True
+
+# -----------------------------------------------------
+def delta():
+    '''copy delta from src-table to dst-table. The timestamp column
+    tscolumn is the immutable creation time of the record. We delete
+    all records created since tscolumn - interval in gp, and insert
+    those created since tscolumn - interval in pg.'''
+
+    G.dst.psql_quiet('CREATE SCHEMA gppg; CREATE SCHEMA gppgx;')
+
+    srctab = G.src.getTableInfo()
+    if not srctab:
+        sys.exit('ERROR: Source table %s.%s does not exist or cannot be accessed.' % (dq(G.src.sname), dq(G.src.tname)))
+
+    # check that tscol exists in source
+    tscol = G.cname
+    if not [a.cname for a in srctab.attr if a.cname == tscol]:
+        sys.exit('Missing attribute %s in source table %s.%s' % (tscol, G.src.sname, G.src.tname))
+
+    # if schema mismatch, or dsttab does not exist, just do a copy (but without the primary key)
+    dsttab = G.dst.getTableInfo()
+    if not dsttab or not srctab.isSubset(dsttab):
+        # to disable primary key creation, we just drop G.cname artificially.
+        G.cname = ''
+        return copy()
+
+    sql = "SELECT max(%s) - '%s'::interval from %s.%s"
+    sql = sql % (dq(tscol), G.interval,
+                    dq(G.dst.sname), dq(G.dst.tname))
+    pr_dst(sql)
+    cutoff = G.dst.psql(sql)
+    if not cutoff:
+        cutoff = '1970-01-01'
+
+    EXT_DELTA = 'gppgx."%s_delta"' % (G.dst.tname)
+    srcSelect = "SELECT %s from %s.%s where %s >= '%s' or %s is null"
+    srcSelect = srcSelect % (srctab.columnClauseEx(), dq(G.src.sname), dq(G.src.tname), dq(tscol), cutoff, dq(tscol))
+    srcColType = srctab.columnAndTypeClause()
+    makeExternalTable(G.src, G.dst, srcSelect, srcColType, EXT_DELTA)
+
+    sql = '''
+DELETE FROM %s.%s
+    where %s >= '%s';
+INSERT INTO %s.%s(%s)
+    SELECT %s from %s;
+''' % (dq(G.dst.sname), dq(G.dst.tname), 
+       dq(tscol), cutoff,
+       dq(G.dst.sname), dq(G.dst.tname), srctab.columnClause(),
+       srctab.columnClause(), EXT_DELTA)
+
+    pr_dst(sql)
+    G.dst.psql(sql)
+    return True
+    
+    
+
+# -----------------------------------------------------
+def usage(msg=''):
+    sys.exit('''usage: %s {command} {options}
+
+Command maybe copy, sync, or delta, as detailed below:
+
+copy -u user -h host [-p port] -d dbname -s schema -t tabname 
+     [-U user -P port -D dbname] 
+     [-S newschema -T newtabname] [-O newowner] [-c pkey]
+     [-v] [-z] [-a]
+
+sync -c pkey -u user -h host [-p port] -d dbname -s schema -t tabname 
+     [-U user -P port -D dbname] 
+     [-S newschema -T newtabname] [-O newowner] 
+     [-v]
+
+delta -i interval -c tscolumn -u user -h host [-p port] -d dbname -s schema -t tabname 
+     [-U user -P port -D dbname] 
+     [-S newschema -T newtabname] [-O newowner]
+     [-v]
+
+
+Note:
+    Lowercase flags are used to specify source (pg) properties.
+    Uppercase flags are used to specify destination (gp) properties.
+
+    -U -P -D may be supplied via environ variables PGUSER, PGPORT, PGDATABASE.
+    -S -T are defaulted to the values of -s and -t if not supplied.
+    -i interval is of the form '3 months' or '3 hours'.
+
+    -v for verbose
+
+    For copy, these flags are supported:
+    -a if the new table should be append-only
+    -z if the new table should be column-oriented compressed append-only 
+
+    Password to the source database is expected in the env
+       PGPASSWORD_{DBNAME}_{USER}.
+
+    The destination database is always on localhost, and its password
+    must be specified in PGPASSWORD env.
+
+%s''' % (sys.argv[0], msg))
+
+
+
+# -----------------------------------------------------
+def main():
+    if len(sys.argv) <= 1:
+        usage()
+
+    op = sys.argv[1]
+    if op not in ('copy', 'sync', 'delta'):
+        usage()
+
+    opts, args = getopt.getopt(sys.argv[2:], 'vu:h:p:d:s:t:U:P:D:S:T:O:i:c:')
+    for o, v in opts:
+        if o == '-v':       G.verbose = True
+	elif o == '-u':     G.src.user = v
+        elif o == '-h':     G.src.host = v
+        elif o == '-p':     G.src.port = v
+        elif o == '-d':     G.src.dbname = v
+        elif o == '-s':     G.src.sname = v
+        elif o == '-t':     G.src.tname = v
+        elif o == '-U':     G.dst.user = v
+        elif o == '-P':     G.dst.port = v
+        elif o == '-D':     G.dst.dbname = v
+        elif o == '-S':     G.dst.sname = v
+        elif o == '-T':     G.dst.tname = v
+        elif o == '-O':     G.owner = v
+        elif o == '-i':     G.interval = v
+        elif o == '-c':     G.cname = v
+        else:
+            usage('ERROR: bad option %s' % o)
+
+    # Set all the defaults
+    G.dst.host = 'localhost'  # always the case
+    if not G.src.port: G.src.port = '5432'
+    if not G.dst.port: G.dst.port = os.environ.get('PGPORT', '5432')
+    if not G.dst.user:
+        G.dst.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
+    if not G.dst.dbname:
+        G.dst.dbname = os.environ.get('PGDATABASE', '')
+
+    if not G.dst.sname: G.dst.sname = G.src.sname
+    if not G.dst.tname: G.dst.tname = G.src.tname
+    if not G.owner: G.owner = G.dst.user
+
+    # Check for missing arguments and options
+    if not G.src.user: sys.exit('Please specify -u user')
+    if not G.src.host: sys.exit('Please specify -h host')
+    if not G.src.dbname: sys.exit('Please specify -d dbname')
+    if not G.src.sname: sys.exit('Please specify -s schema')
+    if not G.src.tname: sys.exit('Please specify -t tabname')
+    if not G.dst.user:   sys.exit('Please specify -U user')
+    if not G.dst.dbname: sys.exit('Please specify -D dbname')
+    if not G.dst.sname: sys.exit('Please specify -S schema')
+    if not G.dst.tname: sys.exit('Please specify -T tabname')
+
+    set_verbose(G.verbose)
+
+    if op == 'copy':
+        copy()
+    elif op == 'sync':
+        sync()
+    elif op == 'delta':
+        if not G.cname: sys.exit('Please specify -c tscolumn')
+        if not G.interval: sys.exit('Please specify -i interval')
+        delta()
+    else:
+        usage('ERROR: please specify copy, sync or delta.')
+
+
+# -----------------------------------------------------
+if __name__ == '__main__':
+    main()

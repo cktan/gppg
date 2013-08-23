@@ -1,0 +1,111 @@
+#!/usr/bin/env python
+#
+import sys, os, getopt
+from gppg import *
+
+def usage(msg=''):
+    sys.exit('''usage: %s [-v] [-U user] [-H host] [-P port] [-D dbname] -S sname -T tname -O owner
+
+    Look for {sname}__{tname} table under gppg schema and move it to
+    sname.tname.
+
+%s''' % (sys.argv[0], msg))
+
+
+    
+# -----------------------------------------------------
+class Global:
+    verbose = False
+    dst = DB()
+    owner = ''
+    
+
+G = Global()
+
+# -----------------------------------------------------
+def move():
+    mname = G.dst.sname + '__' + G.dst.tname
+    # check that gppg.{sname}__{tname} exists
+    sql = '''
+    select 1 
+    from information_schema.tables 
+    where table_schema = 'gppg' and table_name = '%s';
+    '''
+    sql = sql % (dq(mname))
+    pr_dst(sql)
+    s = G.dst.psql(sql)
+    if not s.strip():
+        sys.exit('ERROR: table gppg.%s does not exist' % dq(mname))
+
+    # set owner
+    sql = 'alter table gppg.%s owner to %s' % (dq(mname), G.owner)
+    pr_dst(sql)
+    G.dst.psql(sql)
+
+    # create sname silently 
+    sql = 'create schema %s' % (dq(G.sname))
+    pr_dst(sql)
+    G.dst.psql_quiet(sql)
+
+    sql = 'alter schema %s owner to %s' % (dq(G.sname), G.owner)
+    pr_dst(sql)
+    G.dst.psql_quiet(sql)
+
+    # if normal table, move table with a 10s timeout condition
+    if not '_1_prt_' in G.dst.tname:
+        sql = '''
+        set statement_timeout=10000;
+        drop table if exists %s.%s;
+        alter table gppg.%s set schema %s;
+        alter table %s.%s rename to %s;
+        '''
+        sql = sql % (dq(G.dst.sname), dq(G.dst.tname),
+                     dq(mname), dq(G.dst.sname),
+                     dq(G.dst.sname), dq(mname), dq(G.dst.tname))
+        pr_dst(sql)
+        G.dst.psql(sql)
+        return True
+
+    # if partitioned table, lock parent table and swap the partitions, rename, and drop
+    sys.exit('ERROR: cannot move partitioned table, yet.')
+
+    
+# -----------------------------------------------------
+def main():
+    if len(sys.argv) == 1:
+        usage()
+
+    opts, args = getopt.getopt(sys.argv[2:], 'vH:U:P:D:S:T:O:')
+    for o, v in opts:
+        if o == '-v':       G.verbose = True
+        elif o == '-H':     G.dst.host = v
+        elif o == '-U':     G.dst.user = v
+        elif o == '-P':     G.dst.port = v
+        elif o == '-D':     G.dst.dbname = v
+        elif o == '-S':     G.dst.sname = v
+        elif o == '-T':     G.dst.tname = v
+        elif o == '-O':     G.owner = v
+
+    if not G.dst.host:
+        G.dst.host = os.environ.get('PGHOST', '')
+    if not G.dst.port:
+        G.dst.port = os.environ.get('PGPORT', '5432')
+    if not G.dst.user:
+        G.dst.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
+    if not G.dst.dbname: 
+        G.dst.dbname = os.environ.get('PGDATABASE', '')
+
+    if not G.dst.host: sys.exit('Please specify -H host')
+    if not G.dst.user: sys.exit('Please specify -U user')
+    if not G.dst.dbname: sys.exit('Please specify -D dbname')
+    if not G.dst.sname: sys.exit('Please specify -S schema')
+    if not G.dst.tname: sys.exit('Please specify -T tabname')
+    if not G.dst.owner: sys.exit('Please specify -O owner')
+
+    set_verbose(G.verbose)
+
+    move()
+    
+# -----------------------------------------------------
+if __name__ == '__main__':
+    main()

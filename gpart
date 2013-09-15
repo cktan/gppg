@@ -3,16 +3,6 @@
 import sys, os, getopt
 from gppg import *
 
-def usage(msg=''):
-    sys.exit('''usage: %s [-i interval] -c tscolumn -D dbname -S schema -T tabname -O owner [-v]
-
-Partition a table into monthly sub-partitions.
-
-If -i interval is specified, compress any partition created before now() - interval.
-
-
-%s''' % (sys.argv[0], msg))
-
 
 # -----------------------------------------------------
 def setup_default_partition():
@@ -205,35 +195,52 @@ class Global:
 G = Global()
 
 # -----------------------------------------------------
+def usage(msg=''):
+    sys.exit('''usage: %s [-v] {options}
+
+    Valid Options: 
+        [-i interval] 
+        -c tscolumn 
+        -U user -H host [-P port] 
+        -D dbname -S schema -T tabname 
+        -O owner 
+
+    Partition a table into monthly sub-partitions.
+
+    If -i interval is specified, compress any partition created before now() - interval.
+
+    Passwords to the databases are expected in the env variables
+    PGPASSWORD__{DBNAME}__{USER}.
+
+%s''' % (sys.argv[0], msg))
+
+# -----------------------------------------------------
 def main():
     if len(sys.argv) == 1:
         usage()
         
-    opts, args = getopt.getopt(sys.argv[1:], 'vi:c:P:D:S:T:O:')
+    opts, args = getopt.getopt(sys.argv[1:], 'vi:c:U:H:P:D:S:T:O:')
     for o, v in opts:
         if o == '-v':   G.verbose = True
         elif o == '-i': G.interval= v
         elif o == '-c': G.cname = v
-        elif o == '-O': G.owner = v
+        elif o == '-U': G.dst.user = v
+        elif o == '-H': G.dst.host = v
         elif o == '-P': G.dst.port = v
         elif o == '-D': G.dst.dbname = v
         elif o == '-S': G.dst.sname = v
         elif o == '-T': G.dst.tname = v
+        elif o == '-O': G.owner = v
 
-    G.dst.host = 'localhost' # always the case
-    if not G.dst.port:
-        G.dst.port = os.environ.get('PGPORT', '5432')
-    if not G.dst.user:
-        G.dst.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
-    if not G.dst.dbname: 
-        G.dst.dbname = os.environ.get('PGDATABASE', '')
-
-    if not G.dst.user: sys.exit('Please specify -U user')
+    if not G.dst.port: G.dst.port = '5432'
+        
+    if not G.dst.user:   sys.exit('Please specify -U user')
+    if not G.dst.host:   sys.exit('Please specify -H host')
     if not G.dst.dbname: sys.exit('Please specify -D dbname')
-    if not G.dst.sname: sys.exit('Please specify -S schema')
-    if not G.dst.tname: sys.exit('Please specify -T tabname')
-    if not G.cname: sys.exit('Please specify -c tscolumn')
-    if not G.owner: sys.exit('Please specify -O owner')
+    if not G.dst.sname:  sys.exit('Please specify -S schema')
+    if not G.dst.tname:  sys.exit('Please specify -T tabname')
+    if not G.cname:      sys.exit('Please specify -c tscolumn')
+    if not G.owner:      sys.exit('Please specify -O owner')
     # note: G.interval (-i) is optional
     
     set_verbose(G.verbose)

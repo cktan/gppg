@@ -92,26 +92,24 @@ def usage(msg=''):
 
 Command may be copy or sync, as detailed below:
 
-copy [-u user -p port -d dbname] -s gpschema -t gptabname 
-    -U user -H host [-P port] -D dbname 
+copy -u user -h host [-p port] -d dbname -s gpschema -t gptabname 
+    -U user [-P port] -D dbname 
     [-S pgschema -T pgtabname] [-O owner] [-c pkey] 
 
-sync -c pkey [-u user -p port -d dbname] -s gpschema -t gptabname
-    -U user -H host [-P port] -D dbname 
+sync -c pkey -u user -h host [-p port] -d dbname -s gpschema -t gptabname
+    -U user [-P port] -D dbname 
     [-S pgschema -T pgtabname] [-O owner]
 
 Note:
     Lowercase flags are used to specify source (gp) properties.
     Uppercase flags are used to specify destination (pg) properties.
     
-    -u -p -d may be supplied via environ variables PGUSER, PGPORT, PGDATABASE.
     -S -T are defaulted to the values of -s and -t if not supplied.
+    -O defaults to value of -U if not supplied.
 
-    Password to the destination database is expected in the env
-        PGPASSWORD_{DBNAME}_{USER}
+    Passwords to the databases are expected in the env
+        PGPASSWORD__{DBNAME}__{USER}
 
-    The source database is always localhost, and its password must be 
-    specified in PGPASSWORD env.
 
 %s
 ''' % (sys.argv[0], msg))
@@ -127,16 +125,16 @@ def main():
     if op not in ('copy', 'sync'):
         usage()
 
-    opts, args = getopt.getopt(sys.argv[2:], 'vu:p:d:s:t:U:H:P:D:S:T:O:c:')
+    opts, args = getopt.getopt(sys.argv[2:], 'vu:h:p:d:s:t:U:P:D:S:T:O:c:')
     for o, v in opts:
         if o == '-v':       G.verbose = True
-	elif o == '-u':     G.src.user = v
+        elif o == '-u':     G.src.user = v
+        elif o == '-h':     G.src.host = v
         elif o == '-p':     G.src.port = v
         elif o == '-d':     G.src.dbname = v
         elif o == '-s':     G.src.sname = v
         elif o == '-t':     G.src.tname = v
         elif o == '-U':     G.dst.user = v
-        elif o == '-H':     G.dst.host = v
         elif o == '-P':     G.dst.port = v
         elif o == '-D':     G.dst.dbname = v
         elif o == '-S':     G.dst.sname = v
@@ -147,27 +145,23 @@ def main():
             usage('ERROR: bad option %s' % o)
 
     # Set all the defaults
-    G.src.host = 'localhost'  # always the case
-    if not G.src.port: G.src.port = os.environ.get('PGPORT', '5432')
+    G.dst.host = 'localhost'
+    if not G.src.port: G.src.port = '5432'
     if not G.dst.port: G.dst.port = '5432'
-    if not G.src.user:
-        G.src.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
-        if not G.src.user:
-            sys.exit('Please specify user of source DB in PGUSER env')
-    if not G.src.dbname:
-        G.src.dbname = os.environ.get('PGDATABASE', '')
-        if not G.src.dbname:
-            sys.exit('Please specify source DB name in PGDATABASE env')
     if not G.src.sname: G.src.sname = G.dst.sname
     if not G.src.tname: G.src.tname = G.dst.tname
     if not G.owner: G.owner = G.dst.user
 
     # Check for missing arguments and options
     if not G.dst.user: sys.exit('Please specify -U user.')
-    if not G.dst.host: sys.exit('Please specify -H host.')
     if not G.dst.dbname: sys.exit('Please specify -D dbname.')
     if not G.dst.sname: sys.exit('Please specify -S schema.')
     if not G.dst.tname: sys.exit('Please specify -T tabname.')
+    if not G.src.user: sys.exit('Please specify -u user.')
+    if not G.src.host: sys.exit('Please specify -h host.')
+    if not G.src.dbname: sys.exit('Please specify -d dbname.')
+    if not G.src.sname: sys.exit('Please specify -s schema.')
+    if not G.src.tname: sys.exit('Please specify -t tabname.')
 
     set_verbose(G.verbose)
 

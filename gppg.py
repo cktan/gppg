@@ -115,7 +115,7 @@ class DB:
     def psql_raw(self, sql, stdin=None, stdout=None, stderr=None):
         env = os.environ.copy()
         if not self.passwd:
-            passwd_key = ('PGPASSWORD_%s_%s' % (self.dbname, self.user)).upper()
+            passwd_key = ('PGPASSWORD__%s__%s' % (self.dbname, self.user)).upper()
             self.passwd = (env.get(passwd_key, '')).strip()
             if not self.passwd:
                 sys.exit('env %s not set' % passwd_key)

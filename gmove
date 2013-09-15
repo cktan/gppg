@@ -3,15 +3,6 @@
 import sys, os, getopt
 from gppg import *
 
-def usage(msg=''):
-    sys.exit('''usage: %s [-v] [-U user] [-H host] [-P port] [-D dbname] -S sname -T tname -O owner
-
-    Look for {sname}__{tname} table under gppg schema and move it to
-    sname.tname.
-
-%s''' % (sys.argv[0], msg))
-
-
     
 # -----------------------------------------------------
 class Global:
@@ -71,36 +62,48 @@ def move():
 
     
 # -----------------------------------------------------
+def usage(msg=''):
+    sys.exit('''usage: %s [-v] {options}
+
+    Valid Options:
+        -U user -H host [-P port] 
+        -D dbname -S sname -T tname 
+        -O owner
+
+    Look for {sname}__{tname} table under gppg schema and move it to
+    sname.tname.
+    
+    Passwords to the databases are expected in the env variables
+    PGPASSWORD__{DBNAME}__{USER}.
+
+%s''' % (sys.argv[0], msg))
+
+
+# -----------------------------------------------------
 def main():
     if len(sys.argv) == 1:
         usage()
 
-    opts, args = getopt.getopt(sys.argv[2:], 'vH:U:P:D:S:T:O:')
+    opts, args = getopt.getopt(sys.argv[2:], 'vU:H:P:D:S:T:O:')
     for o, v in opts:
         if o == '-v':       G.verbose = True
-        elif o == '-H':     G.dst.host = v
         elif o == '-U':     G.dst.user = v
+        elif o == '-H':     G.dst.host = v
         elif o == '-P':     G.dst.port = v
         elif o == '-D':     G.dst.dbname = v
         elif o == '-S':     G.dst.sname = v
         elif o == '-T':     G.dst.tname = v
         elif o == '-O':     G.owner = v
 
-    if not G.dst.host:
-        G.dst.host = os.environ.get('PGHOST', '')
-    if not G.dst.port:
-        G.dst.port = os.environ.get('PGPORT', '5432')
-    if not G.dst.user:
-        G.dst.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
-    if not G.dst.dbname: 
-        G.dst.dbname = os.environ.get('PGDATABASE', '')
+    if not G.dst.port: G.dst.port = '5432'
 
-    if not G.dst.host: sys.exit('Please specify -H host')
-    if not G.dst.user: sys.exit('Please specify -U user')
+    if not G.dst.user:   sys.exit('Please specify -U user')
+    if not G.dst.host:   sys.exit('Please specify -H host')
     if not G.dst.dbname: sys.exit('Please specify -D dbname')
-    if not G.dst.sname: sys.exit('Please specify -S schema')
-    if not G.dst.tname: sys.exit('Please specify -T tabname')
-    if not G.dst.owner: sys.exit('Please specify -O owner')
+    if not G.dst.sname:  sys.exit('Please specify -S schema')
+    if not G.dst.tname:  sys.exit('Please specify -T tabname')
+    if not G.cname:      sys.exit('Please specify -c tscolumn')
+    if not G.owner:      sys.exit('Please specify -O owner')
 
     set_verbose(G.verbose)
 

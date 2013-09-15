@@ -317,18 +317,18 @@ def usage(msg=''):
 Command maybe copy, sync, or delta, as detailed below:
 
 copy -u user -h host [-p port] -d dbname -s schema -t tabname 
-     [-U user -P port -D dbname] 
-     [-S newschema -T newtabname] [-O newowner] [-c pkey]
+     -U user [-P port] -D dbname [-S newschema -T newtabname] 
+     [-O newowner] [-c pkey]
      [-v] [-z] [-a]
 
 sync -c pkey -u user -h host [-p port] -d dbname -s schema -t tabname 
-     [-U user -P port -D dbname] 
-     [-S newschema -T newtabname] [-O newowner] 
+     -U user [-P port] -D dbname [-S newschema -T newtabname] 
+     [-O newowner] 
      [-v]
 
 delta -i interval -c tscolumn -u user -h host [-p port] -d dbname -s schema -t tabname 
-     [-U user -P port -D dbname] 
-     [-S newschema -T newtabname] [-O newowner]
+     -U user [-P port] -D dbname [-S newschema -T newtabname] 
+     [-O newowner]
      [-v]
 
 
@@ -336,8 +336,8 @@ Note:
     Lowercase flags are used to specify source (pg) properties.
     Uppercase flags are used to specify destination (gp) properties.
 
-    -U -P -D may be supplied via environ variables PGUSER, PGPORT, PGDATABASE.
     -S -T are defaulted to the values of -s and -t if not supplied.
+    -O defaults to value of -U if not supplied.
     -i interval is of the form '3 months' or '3 hours'.
 
     -v for verbose
@@ -346,11 +346,11 @@ Note:
     -a if the new table should be append-only
     -z if the new table should be column-oriented compressed append-only 
 
-    Password to the source database is expected in the env
-       PGPASSWORD_{DBNAME}_{USER}.
+    Passwords to the databases are expected in the env variables
+    PGPASSWORD__{DBNAME}__{USER}.
 
-    The destination database is always on localhost, and its password
-    must be specified in PGPASSWORD env.
+    The destination database is always at localhost because we utilize
+    the local /tmp for storing load scripts.
 
 %s''' % (sys.argv[0], msg))
 
@@ -386,28 +386,23 @@ def main():
             usage('ERROR: bad option %s' % o)
 
     # Set all the defaults
-    G.dst.host = 'localhost'  # always the case
+    G.dst.host = 'localhost'   # always the case
     if not G.src.port: G.src.port = '5432'
-    if not G.dst.port: G.dst.port = os.environ.get('PGPORT', '5432')
-    if not G.dst.user:
-        G.dst.user = os.environ.get('PGUSER', os.environ.get('USER', ''))
-    if not G.dst.dbname:
-        G.dst.dbname = os.environ.get('PGDATABASE', '')
-
+    if not G.dst.port: G.dst.port = '5432'
     if not G.dst.sname: G.dst.sname = G.src.sname
     if not G.dst.tname: G.dst.tname = G.src.tname
     if not G.owner: G.owner = G.dst.user
 
     # Check for missing arguments and options
-    if not G.src.user: sys.exit('Please specify -u user')
-    if not G.src.host: sys.exit('Please specify -h host')
+    if not G.src.user:   sys.exit('Please specify -u user')
+    if not G.src.host:   sys.exit('Please specify -h host')
     if not G.src.dbname: sys.exit('Please specify -d dbname')
-    if not G.src.sname: sys.exit('Please specify -s schema')
-    if not G.src.tname: sys.exit('Please specify -t tabname')
+    if not G.src.sname:  sys.exit('Please specify -s schema')
+    if not G.src.tname:  sys.exit('Please specify -t tabname')
     if not G.dst.user:   sys.exit('Please specify -U user')
     if not G.dst.dbname: sys.exit('Please specify -D dbname')
-    if not G.dst.sname: sys.exit('Please specify -S schema')
-    if not G.dst.tname: sys.exit('Please specify -T tabname')
+    if not G.dst.sname:  sys.exit('Please specify -S schema')
+    if not G.dst.tname:  sys.exit('Please specify -T tabname')
 
     set_verbose(G.verbose)
 

@@ -125,7 +125,7 @@ def main():
     if op not in ('copy', 'sync'):
         usage()
 
-    opts, args = getopt.getopt(sys.argv[2:], 'vu:h:p:d:s:t:U:P:D:S:T:O:c:')
+    opts, args = getopt.getopt(sys.argv[2:], 'vu:h:p:d:s:t:U:H:P:D:S:T:O:c:')
     for o, v in opts:
         if o == '-v':       G.verbose = True
         elif o == '-u':     G.src.user = v
@@ -135,6 +135,7 @@ def main():
         elif o == '-s':     G.src.sname = v
         elif o == '-t':     G.src.tname = v
         elif o == '-U':     G.dst.user = v
+	elif o == '-H':     G.dst.host = v
         elif o == '-P':     G.dst.port = v
         elif o == '-D':     G.dst.dbname = v
         elif o == '-S':     G.dst.sname = v
@@ -145,14 +146,14 @@ def main():
             usage('ERROR: bad option %s' % o)
 
     # Set all the defaults
-    G.dst.host = 'localhost'
     if not G.src.port: G.src.port = '5432'
     if not G.dst.port: G.dst.port = '5432'
-    if not G.src.sname: G.src.sname = G.dst.sname
-    if not G.src.tname: G.src.tname = G.dst.tname
+    if not G.dst.sname: G.dst.sname = G.src.sname
+    if not G.dst.tname: G.dst.tname = G.src.tname
     if not G.owner: G.owner = G.dst.user
 
     # Check for missing arguments and options
+    if not G.dst.host: sys.exit('Please specify -H host.')
     if not G.dst.user: sys.exit('Please specify -U user.')
     if not G.dst.dbname: sys.exit('Please specify -D dbname.')
     if not G.dst.sname: sys.exit('Please specify -S schema.')
